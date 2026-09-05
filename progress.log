@@ -1,0 +1,187 @@
+================================================================================
+PROGRESS LOG — Assignment 2: Socket Exchange
+================================================================================
+Date: 2026-09-06
+Workspace: A2_2024CS50261_2024CS51073
+
+This file records the plan, attempts, decisions, and the path to the final
+implementation. It is a work diary, not part of the wire protocol.
+
+--------------------------------------------------------------------------------
+1. INITIAL SURVEY
+--------------------------------------------------------------------------------
+
+Opened the folder. Found only:
+  - SPEC.md   (implementation specification)
+  - rules.md  (coding constraints)
+  - .gitignore (ignores rules.md, SPEC.md, build/)
+
+No source, Makefile, launchers, or README yet. Earlier local transcripts did
+not contain a partial implementation (one session had hit a usage limit).
+Conclusion: the work is the full C++ socket exchange from a blank tree.
+
+--------------------------------------------------------------------------------
+2. INITIAL PLAN
+--------------------------------------------------------------------------------
+
+Language: C++ (required by rules.md). Direct POSIX TCP sockets. No Boost.Asio,
+libevent, asyncio, or other forbidden frameworks.
+
+Programs:
+  1. Exchange server  — listen, accept many clients, match orders, notify
+  2. Trader client    — LOGIN, BUY/SELL/CANCEL, print async BOUGHT/SOLD
+  3. Market-data client — SUBSCRIBE/UNSUBSCRIBE, print async TRADE
+
+Layout required by SPEC.md:
+  server/run-server
+  client/run-trader
+  client/run-market-data
+  src/
+  Makefile (optional but useful)
+  README.md
+
+Design choices (allowed by the spec):
+  - Concurrency: one thread per connected client + one mutex around exchange
+    state. An idle client blocks only its own recv thread. Shared state
+    (order IDs, book, usernames, subscriptions) is always taken under that
+    mutex.
+  - Matching: same instrument, opposite side, exact same price. Resting
+    orders at a price are FIFO (oldest first). The spec does not name a
+    secondary priority rule; FIFO is deterministic.
+  - Role detection: no HELLO command exists. LOGIN binds Trader;
+    SUBSCRIBE/UNSUBSCRIBE bind Market-Data. Cross-role commands return ERROR.
+  - Notifications: while the mutex is held, collect (session, message)
+    pairs with ORDER_ACCEPTED first, then fills. Release the mutex, then
+    send. Each session has its own send mutex so two threads cannot
+    interleave bytes on one TCP stream.
+  - Disconnected traders: outstanding orders stay (weak owner pointer).
+    Later fills still happen; BOUGHT/SOLD is skipped if the owner is gone;
+    TRADE still goes to subscribers.
+  - I/O: recv line-buffer per connection. send loops until the full
+    "message\n" is written.
+  - Launchers: POSIX sh using exec and "$@" .
+  - Build: Makefile, C++17, -pthread, binaries in build/.
+  - Verify on WSL (this host is Windows; the course VM is FreeBSD; both
+    are POSIX enough for this code).
+
+Test plan:
+  login uniqueness, equal-price match, unequal-price no match, partial
+  fill, cancel, MD TRADE, disconnect leaving orders, malformed input,
+  split/coalesced TCP writes.
+
+--------------------------------------------------------------------------------
+3. WHAT WAS TRIED AND HOW THE WORK MOVED
+--------------------------------------------------------------------------------
+
+Step A — Read SPEC.md and rules.md end to end.
+  Needed a complete picture before writing sockets code: newline framing,
+  exact match price, trader disconnect does not cancel orders, TRADE never
+  goes to traders, launchers must exec.
+
+Step B — Start this log with the plan above, then write code against it.
+  Did not invent extra protocol verbs. Clients print server lines as they
+  arrive so asynchronous BOUGHT/SOLD/TRADE work.
+
+Step C — Implement src/common.hpp and src/common.cpp first.
+  Reason: framing and integer/instrument parsing are shared by all three
+  programs. parse_i32 accepts only digits (rejects "+", "-", empty, overflow).
+  LineReader keeps a per-connection buffer so a message can be split across
+  recv() calls and several messages can arrive in one recv(). send_all loops
+  on partial writes. SIGPIPE ignored; SO_NOSIGPIPE set when the OS has it
+  (FreeBSD).
+
+Step D — Implement src/server.cpp (session + book + accept loop).
+  First draft stored market-data clients as raw Session* and then tried to
+  wrap them in shared_ptr at TRADE time via a helper that returned nullptr.
+  That would have silently dropped every TRADE. Caught while reviewing the
+  draft, before relying on tests. Changed md_clients_ to
+  map<Session*, shared_ptr<Session>> so TRADE has a live session to send on.
+
+  Matching lives in Exchange::match: look up the opposite-side deque at the
+  incoming price, FIFO, trade_qty = min(remainings), drop orders at 0.
+
+Step E — Implement trader and market-data clients.
+  Both connect, send one initial command (LOGIN / SUBSCRIBE from argv),
+  then run_interactive_client: a recv thread prints lines, the main thread
+  reads stdin and forwards protocol lines. This is not request/response
+  locking; async notifications print whenever they arrive.
+
+Step F — Makefile, README, launchers.
+  Launchers were written with Unix LF (not CRLF) because a CRLF shebang
+  breaks on FreeBSD. A short Python helper created them, then the helper
+  was deleted so it is not part of the submission.
+
+Step G — Build on WSL with g++ -std=c++17 -Wall -Wextra -pthread.
+  First compile succeeded with no warnings. Windows native g++ (MSYS2)
+  exists but would need Winsock; the assignment is POSIX, so WSL was the
+  right compile target on this machine.
+
+Step H — Temporary Python TCP driver (_proto_test.py) against ./server/run-server.
+  Why Python for the driver: fastest way to control exact bytes on the
+  socket (split LOGIN, two commands in one send) without fighting the
+  interactive stdin clients. Results of the first run:
+
+    ALL TESTS PASSED
+      duplicate username rejected
+      unequal prices did not match
+      cancel of outstanding order
+      partial fill 3 of 5 at price 10, then remaining cancel
+      IMCT full fill; unsubscribed MD did not need that TRADE
+      carol disconnect, bob hits her resting order, MD still got TRADE
+      BUY before LOGIN / trader SUBSCRIBE / bad instrument / qty 0 /
+        negative price / unknown command all ERROR, server still served dave
+      split "LOG"+"IN eve\nBUY ..." parsed as two messages
+
+  That file was deleted after the run so the tree matches the required
+  submission layout (no extra test harness).
+
+Step I — Review against "idle/slow client must not stall the exchange".
+  LOGIN/CANCEL/SUBSCRIBE originally called send() while still holding the
+  exchange mutex. A blocked write could freeze matching for everyone.
+  Refactored those paths to build the response string under the lock and
+  send after release. Order matching already used a PendingSend list +
+  flush() after unlock. Session::alive became atomic to avoid a data race
+  between the worker thread and matching.
+
+Step J — Rebuild server, rerun the same protocol checks.
+  ALL TESTS PASSED again. Makefile also chmod +x the three launchers on
+  `make` so unzip-on-FreeBSD is less likely to leave them non-executable.
+
+--------------------------------------------------------------------------------
+4. FINAL LAYOUT
+--------------------------------------------------------------------------------
+
+  Makefile
+  README.md
+  progress.log          (this file)
+  server/run-server     -> exec build/exchange-server
+  client/run-trader     -> exec build/trader
+  client/run-market-data -> exec build/market-data
+  src/common.hpp
+  src/common.cpp        sockets, line buffer, parsing, interactive client
+  src/server.cpp        exchange, matching, per-client threads
+  src/trader.cpp
+  src/market_data.cpp
+  build/                produced by make (gitignored)
+
+--------------------------------------------------------------------------------
+5. BEHAVIOR NOTES (implementation choices allowed by the spec)
+--------------------------------------------------------------------------------
+
+  - Order IDs start at 0 and increase for the life of the process.
+  - A trader may CANCEL only its own remaining orders.
+  - ERROR reason strings are short English phrases; the spec does not
+    freeze the exact text, only the "ERROR <reason>" shape.
+  - First LOGIN (even if the username is taken) marks the connection as
+    a Trader so a later SUBSCRIBE is "not permitted" rather than flipping
+    the role.
+  - Self-trade is allowed; the spec has no inventory or cash checks.
+
+--------------------------------------------------------------------------------
+6. HOW TO REBUILD
+--------------------------------------------------------------------------------
+
+  make
+  ./server/run-server 127.0.0.1 5000
+  ./client/run-trader 127.0.0.1 5000 alice
+  ./client/run-market-data 127.0.0.1 5000 JNST
