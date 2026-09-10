@@ -4,11 +4,13 @@
 #include <cerrno>
 #include <cstdlib>
 #include <cstring>
+#include <fcntl.h>
 #include <iostream>
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -76,6 +78,45 @@ void set_nosigpipe(int fd) {
 #endif
 }
 
+void set_nonblock(int fd) {
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags < 0) {
+        flags = 0;
+    }
+    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+}
+
+void set_small_sockbufs(int fd) {
+    int sz = kSmallSockBuf;
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof(sz));
+}
+
+void set_nodelay(int fd) {
+    int one = 1;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+}
+
+void configure_accepted_socket(int fd) {
+    set_nosigpipe(fd);
+    set_nonblock(fd);
+    set_small_sockbufs(fd);
+    set_nodelay(fd);
+}
+
+bool raise_open_file_limit() {
+    struct rlimit r {};
+    if (getrlimit(RLIMIT_NOFILE, &r) != 0) {
+        return false;
+    }
+    rlim_t want = 131072;
+    if (r.rlim_max != static_cast<rlim_t>(RLIM_INFINITY) && r.rlim_max < want) {
+        want = r.rlim_max;
+    }
+    r.rlim_cur = want;
+    return setrlimit(RLIMIT_NOFILE, &r) == 0;
+}
+
 static int set_reuse(int fd) {
     int one = 1;
     return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
@@ -98,7 +139,8 @@ int tcp_listen(const std::string& host, const std::string& port) {
             continue;
         }
         set_reuse(fd);
-        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 && listen(fd, 128) == 0) {
+        if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
+            listen(fd, kListenBacklog) == 0) {
             break;
         }
         close(fd);
@@ -163,20 +205,37 @@ bool send_line(int fd, const std::string& msg) {
     return send_all(fd, msg + "\n");
 }
 
+LineReader::LineReader() : fd_(-1) {}
+
 LineReader::LineReader(int fd) : fd_(fd) {}
+
+void LineReader::append(const char* p, size_t n) {
+    buf_.append(p, n);
+}
+
+bool LineReader::overflow() const {
+    return buf_.size() > static_cast<size_t>(kMaxLine);
+}
+
+bool LineReader::pop_line(std::string& line) {
+    auto pos = buf_.find('\n');
+    if (pos == std::string::npos) {
+        return false;
+    }
+    line = buf_.substr(0, pos);
+    buf_.erase(0, pos + 1);
+    if (!line.empty() && line.back() == '\r') {
+        line.pop_back();
+    }
+    return true;
+}
 
 int LineReader::read_line(std::string& line) {
     while (true) {
-        auto pos = buf_.find('\n');
-        if (pos != std::string::npos) {
-            line = buf_.substr(0, pos);
-            buf_.erase(0, pos + 1);
-            if (!line.empty() && line.back() == '\r') {
-                line.pop_back();
-            }
+        if (pop_line(line)) {
             return 1;
         }
-        if (buf_.size() > static_cast<size_t>(kMaxLine)) {
+        if (overflow()) {
             return -1;
         }
         char tmp[1024];

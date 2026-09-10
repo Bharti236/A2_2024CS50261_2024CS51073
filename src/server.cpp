@@ -1,14 +1,16 @@
 #include "common.hpp"
+#include "ioloop.hpp"
 
-#include <atomic>
 #include <algorithm>
+#include <cerrno>
 #include <deque>
 #include <iostream>
 #include <memory>
 #include <mutex>
 #include <string>
-#include <thread>
 #include <unordered_map>
+#include <unordered_set>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <unistd.h>
 #include <utility>
@@ -17,6 +19,9 @@
 enum class Role { Unknown, Trader, MarketData };
 enum class Side { Buy, Sell };
 
+static std::vector<int> g_need_write;
+static std::vector<int> g_need_unwrite;
+
 struct Session {
     int fd = -1;
     Role role = Role::Unknown;
@@ -24,25 +29,50 @@ struct Session {
     std::string username;
     bool sub_jnst = false;
     bool sub_imct = false;
-    std::atomic<bool> alive{true};
-    std::mutex send_mu;
+    bool alive = true;
+    std::string send_buf;
+    LineReader reader;
 
-    bool send(const std::string& msg) {
-        std::lock_guard<std::mutex> g(send_mu);
-        if (!alive.load() || fd < 0) {
-            return false;
+    bool flush_send() {
+        while (!send_buf.empty() && fd >= 0) {
+            ssize_t n = ::send(fd, send_buf.data(), send_buf.size(), 0);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    return true;
+                }
+                return false;
+            }
+            if (n == 0) {
+                return false;
+            }
+            send_buf.erase(0, static_cast<size_t>(n));
         }
-        return send_line(fd, msg);
+        return true;
     }
 
-    void shutdown_fd() {
-        std::lock_guard<std::mutex> g(send_mu);
-        alive.store(false);
-        if (fd >= 0) {
-            shutdown(fd, SHUT_RDWR);
-            close(fd);
-            fd = -1;
+    void note_write() {
+        if (fd < 0) {
+            return;
         }
+        if (send_buf.empty()) {
+            g_need_unwrite.push_back(fd);
+        } else {
+            g_need_write.push_back(fd);
+        }
+    }
+
+    bool send(const std::string& msg) {
+        if (!alive || fd < 0) {
+            return false;
+        }
+        send_buf.append(msg);
+        send_buf.push_back('\n');
+        bool ok = flush_send();
+        note_write();
+        return ok;
     }
 
     bool subscribed(Instrument inst) const {
@@ -83,7 +113,7 @@ public:
                 reply(s, "ERROR invalid arguments");
                 return;
             }
-            s->shutdown_fd();
+            s->alive = false;
             return;
         }
         if (cmd == "LOGIN") {
@@ -111,7 +141,7 @@ public:
             traders_.erase(s->username);
         }
         s->logged_in = false;
-        s->alive.store(false);
+        s->alive = false;
         md_clients_.erase(s.get());
     }
 
@@ -256,15 +286,15 @@ private:
                 (incoming.side == Side::Sell) ? incoming.owner.lock() : rest.owner.lock();
             std::string insts = instrument_name(incoming.inst);
             std::string payload = insts + " " + std::to_string(tq) + " " + std::to_string(tp);
-            if (buyer && buyer->alive.load()) {
+            if (buyer && buyer->alive) {
                 out.push_back({buyer, "BOUGHT " + payload});
             }
-            if (seller && seller->alive.load()) {
+            if (seller && seller->alive) {
                 out.push_back({seller, "SOLD " + payload});
             }
             for (const auto& kv : md_clients_) {
                 const std::shared_ptr<Session>& md = kv.second;
-                if (md && md->alive.load() && md->subscribed(incoming.inst)) {
+                if (md && md->alive && md->subscribed(incoming.inst)) {
                     out.push_back({md, "TRADE " + payload});
                 }
             }
@@ -358,44 +388,175 @@ private:
     }
 };
 
+static void apply_write_interest(IoLoop& loop, std::unordered_map<int, std::shared_ptr<Session>>& conns) {
+    for (int fd : g_need_unwrite) {
+        auto it = conns.find(fd);
+        if (it != conns.end() && it->second->send_buf.empty()) {
+            loop.remove_write(fd);
+        }
+    }
+    for (int fd : g_need_write) {
+        auto it = conns.find(fd);
+        if (it != conns.end() && !it->second->send_buf.empty()) {
+            loop.add_write(fd);
+        }
+    }
+    g_need_unwrite.clear();
+    g_need_write.clear();
+}
+
 int main(int argc, char** argv) {
     if (argc != 3) {
         std::cerr << "usage: exchange-server <address> <port>\n";
         return 1;
     }
     ignore_sigpipe();
+    if (!raise_open_file_limit()) {
+        std::cerr << "warning: could not raise RLIMIT_NOFILE; check ulimit -n\n";
+    } else {
+        struct rlimit r {};
+        if (getrlimit(RLIMIT_NOFILE, &r) == 0) {
+            std::cerr << "RLIMIT_NOFILE " << r.rlim_cur << "\n";
+        }
+    }
+
     int lfd = tcp_listen(argv[1], argv[2]);
     if (lfd < 0) {
         std::cerr << "failed to listen on " << argv[1] << " " << argv[2] << "\n";
         return 1;
     }
+    set_nonblock(lfd);
+
+    IoLoop loop;
+    if (!loop.valid() || !loop.add_read(lfd)) {
+        std::cerr << "failed to start I/O loop\n";
+        return 1;
+    }
 
     Exchange ex;
-    std::cerr << "listening on " << argv[1] << " " << argv[2] << "\n";
+    std::unordered_map<int, std::shared_ptr<Session>> conns;
+#ifdef __FreeBSD__
+    std::cerr << "listening on " << argv[1] << " " << argv[2] << " (kqueue)\n";
+#else
+    std::cerr << "listening on " << argv[1] << " " << argv[2] << " (poll)\n";
+#endif
+
+    auto drop = [&](int fd) {
+        auto it = conns.find(fd);
+        if (it == conns.end()) {
+            return;
+        }
+        auto sess = it->second;
+        loop.remove(fd);
+        conns.erase(it);
+        ex.disconnect(sess);
+        if (sess->fd >= 0) {
+            close(sess->fd);
+            sess->fd = -1;
+        }
+        sess->alive = false;
+    };
+
+    auto accept_all = [&]() {
+        while (true) {
+            int cfd = accept(lfd, nullptr, nullptr);
+            if (cfd < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                break;
+            }
+            configure_accepted_socket(cfd);
+            auto sess = std::make_shared<Session>();
+            sess->fd = cfd;
+            conns[cfd] = sess;
+            if (!loop.add_read(cfd)) {
+                conns.erase(cfd);
+                close(cfd);
+            }
+        }
+    };
+
+    auto readable = [&](const std::shared_ptr<Session>& sess) -> bool {
+        char tmp[4096];
+        bool peer_closed = false;
+        while (true) {
+            ssize_t n = recv(sess->fd, tmp, sizeof(tmp), 0);
+            if (n < 0) {
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    break;
+                }
+                return false;
+            }
+            if (n == 0) {
+                // A final recv can contain complete application lines before
+                // the EOF.  Dispatch those lines before dropping the fd.
+                peer_closed = true;
+                break;
+            }
+            sess->reader.append(tmp, static_cast<size_t>(n));
+            if (sess->reader.overflow()) {
+                return false;
+            }
+        }
+        std::string line;
+        while (sess->reader.pop_line(line)) {
+            ex.handle_line(sess, line);
+            if (!sess->alive) {
+                return false;
+            }
+        }
+        return !peer_closed;
+    };
 
     while (true) {
-        int cfd = accept(lfd, nullptr, nullptr);
-        if (cfd < 0) {
+        std::vector<std::pair<int, int>> events;
+        if (loop.wait(events) < 0) {
             continue;
         }
-        set_nosigpipe(cfd);
-        auto sess = std::make_shared<Session>();
-        sess->fd = cfd;
-        std::thread([sess, &ex]() {
-            LineReader reader(sess->fd);
-            std::string line;
-            while (sess->fd >= 0) {
-                int rc = reader.read_line(line);
-                if (rc <= 0) {
-                    break;
-                }
-                ex.handle_line(sess, line);
-                if (!sess->alive.load()) {
-                    break;
+        std::unordered_set<int> closing;
+        for (const auto& ev : events) {
+            int fd = ev.first;
+            int mask = ev.second;
+            if (fd == lfd) {
+                accept_all();
+                continue;
+            }
+            auto it = conns.find(fd);
+            if (it == conns.end()) {
+                continue;
+            }
+            auto sess = it->second;
+            if (mask & EV_ERR) {
+                closing.insert(fd);
+                continue;
+            }
+            if (mask & EV_READ) {
+                if (!readable(sess)) {
+                    closing.insert(fd);
+                    continue;
                 }
             }
-            ex.disconnect(sess);
-            sess->shutdown_fd();
-        }).detach();
+            if ((mask & EV_WRITE) && !sess->send_buf.empty()) {
+                if (!sess->flush_send()) {
+                    closing.insert(fd);
+                    continue;
+                }
+                sess->note_write();
+            }
+            if (mask & EV_HUP) {
+                closing.insert(fd);
+            }
+        }
+        apply_write_interest(loop, conns);
+        for (int fd : closing) {
+            drop(fd);
+        }
     }
 }

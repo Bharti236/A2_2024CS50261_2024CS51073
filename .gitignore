@@ -1,3 +1,7 @@
 build/
 rules.md
 SPEC.md
+last_analysis.md
+_proto_test.py
+FAQs.md
+Bonus.md

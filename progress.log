@@ -148,7 +148,7 @@ Step J — Rebuild server, rerun the same protocol checks.
   `make` so unzip-on-FreeBSD is less likely to leave them non-executable.
 
 --------------------------------------------------------------------------------
-4. FINAL LAYOUT
+4. LAYOUT
 --------------------------------------------------------------------------------
 
   Makefile
@@ -157,11 +157,15 @@ Step J — Rebuild server, rerun the same protocol checks.
   server/run-server     -> exec build/exchange-server
   client/run-trader     -> exec build/trader
   client/run-market-data -> exec build/market-data
+  bonus/run-conn-gen    -> exec build/conn-gen
   src/common.hpp
   src/common.cpp        sockets, line buffer, parsing, interactive client
-  src/server.cpp        exchange, matching, per-client threads
+  src/ioloop.hpp / src/ioloop.cpp
+                        kqueue on FreeBSD, poll elsewhere
+  src/server.cpp        exchange + single-threaded I/O loop
   src/trader.cpp
   src/market_data.cpp
+  src/conn_gen.cpp      bonus idle-connection generator
   build/                produced by make (gitignored)
 
 --------------------------------------------------------------------------------
@@ -178,10 +182,59 @@ Step J — Rebuild server, rerun the same protocol checks.
   - Self-trade is allowed; the spec has no inventory or cash checks.
 
 --------------------------------------------------------------------------------
-6. HOW TO REBUILD
+6. BONUS PHASE 1-2 (2026-09-10)
+--------------------------------------------------------------------------------
+
+Plan (from the FAQs/Bonus review, not implemented until this step):
+  Phase 1: replace thread-per-connection with kqueue (poll fallback).
+  Phase 2: idle TCP generator, no application-level messages.
+  Phase 3 (not done): 10k-70k measurements on the FreeBSD VM.
+
+Decisions:
+  - Primary server I/O is kqueue because FAQs.md recommends it for the
+    viva and Bonus.md asks for a multiplexer that can hold tens of
+    thousands of idle sockets. Thread-per-connection would spend a stack
+    per idle fd and cannot reach 70k.
+  - Linux/WSL has no kqueue, so IoLoop uses poll() there. Same server
+    code path: non-blocking accept/recv/send, line buffer, write interest
+    only when the send buffer is non-empty. Protocol and matching are
+    unchanged. The mutex around Exchange is kept even though the loop is
+    now one thread; it costs little and keeps handlers easy to reason
+    about.
+  - Listen backlog raised to 8192; accepted sockets get small SO_RCVBUF
+    / SO_SNDBUF (4 KiB) so idle connections do not reserve large kernel
+    buffers. Server and generator call setrlimit(RLIMIT_NOFILE).
+  - Generator does not send LOGIN/SUBSCRIBE. Connections stay Role
+    Unknown and only occupy an fd + kqueue/poll registration. Optional
+    source IPs; if omitted and N is large, rotate 127.0.0.1..127.0.0.N
+    (about 20k connections per address) so ephemeral ports are not the
+    first cliff. Bind failure is a warning, not a hard stop, because
+    FreeBSD loopback aliases may be missing.
+  - Launcher is bonus/run-conn-gen so SPEC.md's server/ and client/
+    names stay as required. README documents ulimit and ifconfig aliases.
+
+What was tried:
+  - First approach in the original assignment was one thread per accept.
+    That is gone from the server; traders/MD clients still use two
+    threads (stdin + socket), which FAQs.md allows.
+  - A first HUP handler only closed a socket when send_buf was empty
+    and alive was already false. An idle generator disconnect would not
+    match that, so kqueue/poll hangup now always drops the connection
+    after the current read/write handling.
+  - Generator originally required an explicit local-IP list and treated
+    bind failure as a dead connection. That would fail on a stock
+    FreeBSD lo0. Changed to auto IPs + continue unbound after bind
+    errors, with a one-time stderr hint.
+
+Phase 3 is still outstanding (resource table, tool transcripts, §7
+analysis on the VM).
+
+--------------------------------------------------------------------------------
+7. HOW TO REBUILD
 --------------------------------------------------------------------------------
 
   make
   ./server/run-server 127.0.0.1 5000
   ./client/run-trader 127.0.0.1 5000 alice
   ./client/run-market-data 127.0.0.1 5000 JNST
+  ./bonus/run-conn-gen 127.0.0.1 5000 10000
